@@ -35,14 +35,20 @@ RSI_OVERBOUGHT = 65
 RSI_OVERBOUGHT_STRONG = 72
 
 # Risk management
-MAX_POSITION_PCT = 0.90  # Max 90% of equity in position
+MAX_POSITION_PCT = 0.95  # Max 95% of equity in position
 MIN_TRADE_PNL_USD = 0.50  # Minimum PnL in USD to consider a trade valid
-MAX_DRAWDOWN_PCT = 0.20   # Hard stop at 20% drawdown from peak equity
+MAX_DRAWDOWN_PCT = 0.25   # Hard stop at 25% drawdown from peak equity
 
 # Order fees
 FEE_BPS = 4.0    # 4 basis points fee
 SLIPPAGE_BPS = 2.0  # 2 basis points slippage
 TOTAL_COST_BPS = FEE_BPS + SLIPPAGE_BPS  # 6 bps round-trip cost
+
+# Strategy tuning
+SIGNAL_THRESHOLD_OPEN = 4  # Min score to open position
+SIGNAL_THRESHOLD_CLOSE = 3  # Min abs score to close
+SIGNAL_THRESHOLD_SCALE = 7  # Score to add to existing
+COOLDOWN_BARS = 2  # Bars between trades
 
 # ─── State ───────────────────────────────────────────────────────────────────
 class State:
@@ -201,19 +207,19 @@ def adx(highs: list, lows: list, closes: list, period: int = 14) -> list:
     if atr_vals[period - 1] == 0:
         return result
     
-    # Smoothed +DI, -DI
+    # Smoothed +DI, -DI (Wilders smoothing)
     smoothed_plus = sum(dm_plus[1:period + 1])
     smoothed_minus = sum(dm_minus[1:period + 1])
     
     for i in range(period, len(closes)):
-        smoothed_plus = smoothed_plus * (period - 1) + dm_plus[i]
-        smoothed_minus = smoothed_minus * (period - 1) + dm_minus[i]
+        smoothed_plus = smoothed_plus - smoothed_plus / period + dm_plus[i]
+        smoothed_minus = smoothed_minus - smoothed_minus / period + dm_minus[i]
         
-        atr_smooth = atr_vals[i] * period  # Simplified
+        atr_i = atr_vals[i]
         
-        if atr_smooth > 0:
-            di_plus = 100 * smoothed_plus / atr_smooth
-            di_minus = 100 * smoothed_minus / atr_smooth
+        if atr_i > 0:
+            di_plus = 100 * smoothed_plus / atr_i
+            di_minus = 100 * smoothed_minus / atr_i
         else:
             di_plus = 50
             di_minus = 50
@@ -318,19 +324,49 @@ class TradingBot:
             score -= 2
             reasons.append("bearish_ema_aligned")
         
-        # 3. RSI confirmation
-        if rsi_val < RSI_OVERSOLD_STRONG:
-            score += 3
-            reasons.append("rsi_extremely_oversold")
-        elif rsi_val < RSI_OVERSOLD:
-            score += 1
-            reasons.append("rsi_oversold")
-        elif rsi_val > RSI_OVERBOUGHT_STRONG:
-            score -= 3
-            reasons.append("rsi_extremely_overbought")
-        elif rsi_val > RSI_OVERBOUGHT:
-            score -= 1
-            reasons.append("rsi_overbought")
+        # 3. RSI confirmation (context-aware)
+        # Pre-compute trend direction from EMAs for RSI context
+        trend_dir = 0  # 1=bullish, -1=bearish
+        if fast_e > med_e:
+            trend_dir = 1
+        elif fast_e < med_e:
+            trend_dir = -1
+        
+        if adx_val > ADX_THRESHOLD and trend_dir != 0:
+            # In strong trend: RSI overbought = trend confirmation, oversold = pullback entry
+            if rsi_val < RSI_OVERSOLD_STRONG and trend_dir == 1:
+                score += 2
+                reasons.append("rsi_pullback_entry_uptrend")
+            elif rsi_val < RSI_OVERSOLD and trend_dir == 1:
+                score += 1
+                reasons.append("rsi_dip_buy")
+            elif rsi_val > RSI_OVERBOUGHT_STRONG and trend_dir == -1:
+                score += 2
+                reasons.append("rsi_pullback_entry_downtrend")
+            elif rsi_val > RSI_OVERBOUGHT and trend_dir == -1:
+                score += 1
+                reasons.append("rsi_pop_sell")
+            # RSI neutral/contrarian in strong trend: don't fight it
+            elif trend_dir == 1 and rsi_val > 85:
+                score += 1  # Very strong uptrend, ride it
+                reasons.append("rsi_strong_uptrend")
+            elif trend_dir == -1 and rsi_val < 15:
+                score += 1
+                reasons.append("rsi_strong_downtrend")
+        else:
+            # Weak trend: use RSI as mean-reversion signal
+            if rsi_val < RSI_OVERSOLD_STRONG:
+                score += 3
+                reasons.append("rsi_extremely_oversold")
+            elif rsi_val < RSI_OVERSOLD:
+                score += 1
+                reasons.append("rsi_oversold")
+            elif rsi_val > RSI_OVERBOUGHT_STRONG:
+                score -= 3
+                reasons.append("rsi_extremely_overbought")
+            elif rsi_val > RSI_OVERBOUGHT:
+                score -= 1
+                reasons.append("rsi_overbought")
         
         # 4. ADX trend strength filter
         trend_strength = 0  # -1, 0, 1
@@ -374,23 +410,36 @@ class TradingBot:
                 return self._create_close_signal(reasons + ["HARD_DRAWDOWN_STOP"])
             return None
         
-        # Close existing position if signal reverses
-        if self.state.position > 0 and score <= -3:
+        # Close existing position if signal reverses strongly
+        if self.state.position > 0 and score <= -SIGNAL_THRESHOLD_CLOSE:
             return self._create_close_signal(reasons + ["SIGNAL_REVERSAL_LONG"])
-        elif self.state.position < 0 and score >= 3:
+        elif self.state.position < 0 and score >= SIGNAL_THRESHOLD_CLOSE:
             return self._create_close_signal(reasons + ["SIGNAL_REVERSAL_SHORT"])
         
-        # Open new position
-        if score >= 4 and self.state.position == 0:
-            return self._create_buy_signal(score, reasons)
-        elif score <= -4 and self.state.position == 0:
-            return self._create_sell_signal(score, reasons)
+        # Also close if RSI extreme in opposite direction of trend
+        if self.state.position > 0 and rsi_val > 80 and trend_dir == 1:
+            # Strong uptrend but RSI extreme — take partial profit
+            return self._create_close_signal(reasons + ["RSI_TAKE_PROFIT_LONG"])
+        elif self.state.position < 0 and rsi_val < 20 and trend_dir == -1:
+            return self._create_close_signal(reasons + ["RSI_TAKE_PROFIT_SHORT"])
+        
+        # Open new position (respect cooldown)
+        if self.state.cooldown <= 0:
+            if score >= SIGNAL_THRESHOLD_OPEN and self.state.position == 0:
+                return self._create_buy_signal(score, reasons)
+            elif score <= -SIGNAL_THRESHOLD_OPEN and self.state.position == 0:
+                return self._create_sell_signal(score, reasons)
+            # Scale position on strong signals (also respects cooldown)
+            if self.state.position > 0 and score >= SIGNAL_THRESHOLD_SCALE:
+                return self._create_buy_signal(score, reasons + ["SCALE_UP_LONG"])
+            elif self.state.position < 0 and score <= -SIGNAL_THRESHOLD_SCALE:
+                return self._create_sell_signal(score, reasons + ["SCALE_UP_SHORT"])
         
         # Scale position on strong signals
-        if self.state.position > 0 and score >= 6:
+        if self.state.position > 0 and score >= SIGNAL_THRESHOLD_SCALE:
             # Add to winning position
             return self._create_buy_signal(score, reasons + ["SCALE_UP_LONG"])
-        elif self.state.position < 0 and score <= -6:
+        elif self.state.position < 0 and score <= -SIGNAL_THRESHOLD_SCALE:
             return self._create_sell_signal(score, reasons + ["SCALE_UP_SHORT"])
         
         return None
@@ -483,21 +532,23 @@ class TradingBot:
         
         # Update state
         if signal['action'] == 'buy':
-            # Calculate PnL of closing previous short position
+            # Close any short position
             if self.state.position < 0:
-                pnl = abs(self.state.position) * (self.avg_entry - price)
+                pnl = abs(self.state.position) * (self.state.avg_entry - price)
                 self.state.equity += pnl
-            # Set entry
+            # Open/hold long
             self.state.avg_entry = price
             self.state.position = signal['size']
+            self.state.cooldown = COOLDOWN_BARS
         elif signal['action'] == 'sell':
-            # Calculate PnL of closing long position
+            # Close any long position
             if self.state.position > 0:
-                pnl = self.state.position * (price - self.avg_entry)
+                pnl = self.state.position * (price - self.state.avg_entry)
                 self.state.equity += pnl
-            # If selling a long, set new short entry
+            # Open/hold short
             self.state.avg_entry = price
             self.state.position = -signal['size']
+            self.state.cooldown = COOLDOWN_BARS
         
         self.state.update_peak()
         
